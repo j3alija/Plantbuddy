@@ -1,0 +1,1016 @@
+File: plantbuddy\auth.py
+
+from flask import Blueprint, render_template, request, redirect, url_for, flash, session
+from flask_login import login_user, logout_user, login_required, current_user
+from flask_mail import Message
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired
+from .config import Config, s, client
+from .models import db, Customer
+from . import mail
+import requests
+import json
+import os
+
+auth_bp = Blueprint('auth', __name__)
+
+@auth_bp.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+
+        if password != confirm_password:
+            flash("Passwords do not match!")
+            return redirect(url_for('auth.register'))
+
+        existing_user = Customer.query.filter_by(email=email).first()
+        if existing_user:
+            flash('User already exists!')
+            return redirect(url_for('auth.register'))
+
+        new_user = Customer(username=username, email=email)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+
+        flash("Registration successful! Please login.")
+        return redirect(url_for('auth.login'))
+
+    return render_template('register.html')
+
+@auth_bp.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form["email"]
+        password = request.form["password"]
+
+        user = Customer.query.filter_by(email=email).first()
+        if user is None:
+            flash("Email not registered!")
+            return redirect(url_for("auth.login"))
+        elif not user.check_password(password):
+            flash("Invalid password!")
+            return redirect(url_for("auth.login"))
+
+        login_user(user)
+        flash("Login successful!")
+        return redirect(url_for("home"))
+
+    return render_template("login.html")
+
+@auth_bp.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    flash("You have been logged out.")
+    return redirect(url_for("main.home"))
+
+@auth_bp.route("/forgot_password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form["email"]
+        user = Customer.query.filter_by(email=email).first()
+        if user:
+            token = s.dumps(email, salt='password-reset-salt')
+            msg = Message('Password Reset Request', sender=Config.MAIL_USERNAME, recipients=[email])
+            link = url_for('auth.reset_password', token=token, _external=True)
+            msg.body = f'Your link to reset the password is {link}'
+            try:
+                mail.send(msg)
+                flash('An email with a reset link has been sent to your email address.')
+            except Exception as e:
+                flash(f'An error occurred while sending the email: {str(e)}')
+        else:
+            flash('Email address not found.')
+        return redirect(url_for('auth.forgot_password'))
+    return render_template('forgot_password.html')
+
+@auth_bp.route("/reset_password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    try:
+        email = s.loads(token, salt='password-reset-salt', max_age=3600)
+    except SignatureExpired:
+        flash('The reset link has expired.')
+        return redirect(url_for('auth.forgot_password'))
+
+    if request.method == "POST":
+        password = request.form["password"]
+        confirm_password = request.form["confirm_password"]
+
+        if password != confirm_password:
+            flash("Passwords do not match!")
+            return redirect(url_for('auth.reset_password', token=token))
+
+        user = Customer.query.filter_by(email=email).first()
+        user.set_password(password)
+        db.session.commit()
+        flash("Your password has been updated!")
+        return redirect(url_for('auth.login'))
+
+    return render_template('reset_password.html')
+
+@auth_bp.route('/google_login')
+def google_login():
+    google_provider_cfg = requests.get(Config.GOOGLE_DISCOVERY_URL).json()
+    authorization_endpoint = google_provider_cfg['authorization_endpoint']
+
+    request_uri = client.prepare_request_uri(
+        authorization_endpoint,
+        redirect_uri=request.base_url + '/callback',
+        scope=['openid', 'email', 'profile'],
+    )
+    return redirect(request_uri)
+
+@auth_bp.route('/google_login/callback')
+def callback():
+    code = request.args.get('code')
+    google_provider_cfg = requests.get(Config.GOOGLE_DISCOVERY_URL).json()
+    token_endpoint = google_provider_cfg['token_endpoint']
+
+    token_url, headers, body = client.prepare_token_request(
+        token_endpoint,
+        authorization_response=request.url,
+        redirect_url=request.base_url,
+        code=code
+    )
+    token_response = requests.post(
+        token_url,
+        headers=headers,
+        data=body,
+        auth=(Config.GOOGLE_CLIENT_ID, Config.GOOGLE_CLIENT_SECRET),
+    )
+
+    client.parse_request_body_response(json.dumps(token_response.json()))
+
+    userinfo_endpoint = google_provider_cfg['userinfo_endpoint']
+    uri, headers, body = client.add_token(userinfo_endpoint)
+    userinfo_response = requests.get(uri, headers=headers, data=body)
+
+    userinfo = userinfo_response.json()
+    email = userinfo['email']
+
+    user = Customer.query.filter_by(email=email).first()
+    if user is None:
+        user = Customer(
+            username=userinfo['name'],
+            email=email,
+        )
+        # Set a default random password for Google login users
+        user.set_password(os.urandom(24).hex())
+        db.session.add(user)
+        db.session.commit()
+
+    login_user(user)
+    return redirect(url_for('home'))
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\config.py
+
+import os
+from itsdangerous import URLSafeTimedSerializer
+from oauthlib.oauth2 import WebApplicationClient
+
+class Config:
+    INSTANCE_PATH = os.path.join(os.getcwd(), 'instance')
+    SQLALCHEMY_DATABASE_URI = f'sqlite:///{os.path.join(INSTANCE_PATH, "plantbuddy.db")}'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SECRET_KEY = 'key_var'  # Add a unique and secret key here
+    MAIL_SERVER = 'smtp.gmail.com'
+    MAIL_PORT = 587
+    MAIL_USE_TLS = True
+    MAIL_USE_SSL = False
+    MAIL_USERNAME = 'plantbudddy@gmail.com'
+    MAIL_PASSWORD = '#private'  # generated from google
+
+    # OAuth 2 client setup for login with google
+    GOOGLE_CLIENT_ID = '#private'
+    GOOGLE_CLIENT_SECRET = '#private'
+    GOOGLE_DISCOVERY_URL = 'https://accounts.google.com/.well-known/openid-configuration'
+
+def init_app(app):
+    app.config.from_object(Config)
+    app.secret_key = app.config['SECRET_KEY']
+
+s = URLSafeTimedSerializer(Config.SECRET_KEY)
+client = WebApplicationClient(Config.GOOGLE_CLIENT_ID)
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\main.py
+
+from . import create_app
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\models.py
+
+from . import db
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timezone
+from flask_login import UserMixin
+
+class Customer(db.Model, UserMixin):
+    __tablename__ = 'customers'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+
+    plants = db.relationship("CustomerPlant", back_populates="customer")
+    blog_posts = db.relationship("BlogPost", back_populates="author")
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+    def __repr__(self):
+        return '<Customer %r>' % self.username
+
+class Plant(db.Model):
+    __tablename__ = 'plants'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    photo = db.Column(db.String(200), nullable=True)
+    description = db.Column(db.Text, nullable=True)
+    placement = db.Column(db.String(50), nullable=True)  # Partial-shade, bright, sunny
+    water_demand = db.Column(db.String(50), nullable=True)  # Low, medium, high
+    fertilizing = db.Column(db.String(50), nullable=True)  # weekly, monthly, -
+
+    customer_plants = db.relationship("CustomerPlant", back_populates="plant")
+    care_tasks = db.relationship('CareTask', back_populates='plant')
+
+    def __repr__(self):
+        return f'<Plant {self.name}>'
+
+class CustomerPlant(db.Model):
+    __tablename__ = 'customer_plants'
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customers.id'), nullable=False)
+    plant_id = db.Column(db.Integer, db.ForeignKey('plants.id'), nullable=False)
+    last_watered_date = db.Column(db.DateTime, nullable=True)
+
+    customer = db.relationship("Customer", back_populates="plants")
+    plant = db.relationship("Plant", back_populates="customer_plants")
+
+    def __repr__(self):
+        return f'<CustomerPlant customer_id={self.customer_id}, plant_id={self.plant_id}>'
+
+class CareTask(db.Model):
+    __tablename__ = 'care_tasks'
+    id = db.Column(db.Integer, primary_key=True)
+    plant_id = db.Column(db.Integer, db.ForeignKey('plants.id'), nullable=False)
+    task_type = db.Column(db.String(50), nullable=False)  # 'Water' or 'Fertilize'
+    task_date = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    is_completed = db.Column(db.Boolean, default=False)
+    amount = db.Column(db.Float, nullable=False)
+
+    plant = db.relationship('Plant', back_populates='care_tasks')
+
+    def __repr__(self):
+        return f'<CareTask {self.task_type} for {self.plant.name}>'
+
+class BlogPost(db.Model):
+    __tablename__ = 'blog_posts'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    author_id = db.Column(db.Integer, db.ForeignKey('customers.id'), nullable=False)
+    approved = db.Column(db.Boolean, default=False)
+
+    author = db.relationship("Customer", back_populates="blog_posts")
+
+    def __repr__(self):
+        return f'<BlogPost {self.title} by {self.author.username}>'
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\plant_management.py
+
+from flask import Blueprint, render_template, request, redirect, url_for, flash, session
+from .models import db, Plant, CustomerPlant, Customer, CareTask
+from flask_login import login_required, current_user
+from datetime import datetime
+
+plants_bp = Blueprint('plants', __name__)
+
+@plants_bp.route("/")
+def plants():
+    all_plants = Plant.query.all()
+    return render_template("plants.html", plants=all_plants)
+
+@plants_bp.route("/plant/<int:plant_id>")
+def plant_detail(plant_id):
+    plant = Plant.query.get_or_404(plant_id)
+    print(f"Plant Photo Path: {plant.photo}")  # Debugging line
+    return render_template("plant_detail.html", plant=plant)
+
+@plants_bp.route("/add_plant/<int:plant_id>")
+@login_required
+def add_plant():
+    if request.method == "POST":
+        name = request.form["name"]
+        location = request.form["location"]
+        watering_frequency = request.form["watering_frequency"]
+        fertilizing_frequency = request.form["fertilizing_frequency"]
+        common_issues = request.form.get("common_issues")
+
+        new_plant = Plant(
+            name=name,
+            location=location,
+            water_need=watering_frequency,
+            fertilizer_need=fertilizing_frequency,
+            common_issues=common_issues
+        )
+        db.session.add(new_plant)
+        db.session.commit()
+        flash("Plant added successfully!")
+        return redirect(url_for("plants"))
+
+    return render_template("add_plant.html")
+
+@plants_bp.route("/my_plants")
+@login_required
+def my_plants():
+    user_plants = CustomerPlant.query.filter_by(customer_id=current_user.id).all()
+    return render_template("my_plants.html", user_plants=user_plants)
+
+@plants_bp.route("/add", methods=["GET", "POST"])
+@login_required
+def add_new_plant():
+    if request.method == "POST":
+        name = request.form["name"]
+        location = request.form["location"]
+        watering_frequency = request.form["watering_frequency"]
+        fertilizing_frequency = request.form["fertilizing_frequency"]
+        common_issues = request.form.get("common_issues")
+
+        new_plant = Plant(
+            name=name,
+            location=location,
+            water_need=watering_frequency,
+            fertilizer_need=fertilizing_frequency,
+            common_issues=common_issues
+        )
+        db.session.add(new_plant)
+        db.session.commit()
+        flash("Plant added successfully!")
+        return redirect(url_for("plants.plants"))
+
+    return render_template("add_plant.html")
+
+@plants_bp.route("/tasks")
+@login_required
+def tasks():
+    all_tasks = CareTask.query.all()
+    return render_template("tasks.html", tasks=all_tasks)
+
+@plants_bp.route("/add_task", methods=["GET", "POST"])
+@login_required
+def add_task():
+    if request.method == "POST":
+        plant_id = request.form["plant_id"]
+        task_type = request.form["task_type"]
+        task_date = datetime.strptime(request.form["task_date"], '%Y-%m-%d')
+
+        new_task = CareTask(
+            plant_id=plant_id,
+            task_type=task_type,
+            task_date=task_date,
+            is_completed=False,
+            amount=1.0  # Placeholder, adjust as needed
+        )
+        db.session.add(new_task)
+        db.session.commit()
+        flash("Task added successfully!")
+        return redirect(url_for("plants.tasks"))
+
+    plants = Plant.query.all()
+    return render_template("add_task.html", plants=plants)
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\reminder.py
+
+from flask import render_template
+from flask_mail import Message
+from .models import Customer, CustomerPlant, Plant
+from . import mail, db
+from datetime import datetime
+
+def send_reminder():
+    customers = Customer.query.all()
+    for customer in customers:
+        customer_plants = CustomerPlant.query.filter_by(customer_id=customer.id).all()
+        if customer_plants:
+            msg = Message('Plant Care Reminder', sender='plantbudddy@gmail.com', recipients=[customer.email])
+            msg.html = render_template('email/reminder.html', user=customer, plants=[cp.plant for cp in customer_plants])
+            mail.send(msg)
+            for customer_plant in customer_plants:
+                customer_plant.last_watered_date = datetime.utcnow()
+            db.session.commit()
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\routes.py
+
+from flask import Blueprint, render_template, redirect, url_for, flash, session
+from flask_mail import Message
+from datetime import datetime, timezone
+from .models import CareTask
+from . import mail
+
+main_bp = Blueprint('main', __name__)
+
+@main_bp.route("/")
+def index():
+    return render_template("home.html")
+
+@main_bp.route("/home")
+def home():
+    return render_template("home.html")
+
+@main_bp.route("/contact_us")
+def contact_us():
+    return render_template("contact_us.html")
+
+@main_bp.route("/send_reminders")
+def send_reminders():
+    tasks = CareTask.query.filter_by(is_completed=False).all()
+    for task in tasks:
+        if task.task_date.date() == datetime.now(timezone.utc).date():
+            send_email_reminder(task)
+    flash("Reminders sent!")
+    return redirect(url_for("main.tasks"))
+
+def send_email_reminder(task):
+    msg = Message('Plant Care Reminder', recipients=[task.plant.customer.email])
+    msg.body = f"Reminder: {task.task_type} your plant {task.plant.name} on {task.task_date.strftime('%Y-%m-%d')}."
+    mail.send(msg)
+
+def clear_flashes():
+    if '_flashes' in session:
+        del session['_flashes']
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\__init__.py
+
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from flask_mail import Mail
+from flask_login import LoginManager
+from .config import init_app
+import os
+
+db = SQLAlchemy()
+mail = Mail()
+login_manager = LoginManager()
+
+def create_app():
+    app = Flask(__name__, instance_relative_config=True)
+    init_app(app)
+
+    # Set environment variable for development
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+    # Ensure the instance folder exists
+    try:
+        os.makedirs(app.instance_path, exist_ok=True)
+    except OSError:
+        pass
+
+    db.init_app(app)
+    mail.init_app(app)
+    login_manager.init_app(app)
+
+    from .models import Customer
+    @login_manager.user_loader
+    def load_user(user_id):
+        return Customer.query.get(int(user_id))
+
+    with app.app_context():
+        db.create_all()
+
+    from .auth import auth_bp
+    app.register_blueprint(auth_bp)
+
+    from .plant_management import plants_bp
+    app.register_blueprint(plants_bp, url_prefix='/plants')
+
+    from .routes import main_bp
+    app.register_blueprint(main_bp)
+
+    return app
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\add_plant.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Add Plant</title>
+    <link rel="stylesheet" type="text/css" href="/static/style.css">
+</head>
+<body class="add-plant-page">
+    <h1>Add Plant</h1>
+    <form action="{{ url_for('plants.add_new_plant') }}" method="post">
+        <label for="name">Name:</label>
+        <input type="text" id="name" name="name" required>
+        <br>
+        <label for="location">Location:</label>
+        <input type="text" id="location" name="location" required>
+        <br>
+        <label for="watering_frequency">Watering Frequency (days):</label>
+        <input type="number" id="watering_frequency" name="watering_frequency" required>
+        <br>
+        <label for="fertilizing_frequency">Fertilizing Frequency (days):</label>
+        <input type="number" id="fertilizing_frequency" name="fertilizing_frequency" required>
+        <br>
+        <label for="common_issues">Common Issues:</label>
+        <textarea id="common_issues" name="common_issues"></textarea>
+        <br>
+        <button type="submit">Add Plant</button>
+    </form>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\contact_us.html
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kontaktieren Sie uns</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    {% include 'header.html' %}
+    <main>
+        <section class="contact-section">
+            <div class="contact-content">
+                <h1>Kontaktieren Sie uns</h1>
+                <p>Kontaktinformationen</p>
+                <p>Fragen? Feedback? Wir möchten alles hören! Senden Sie uns eine Nachricht an <a href="mailto:info@plantbuddy.com">info@plantbuddy.com</a></p>
+                <button onclick="window.location.href='mailto:info@plantbuddy.com'">Mehr erfahren</button>
+            </div>
+            <div class="contact-image">
+                <img src="{{ url_for('static', filename='images/contact_image.jpg') }}" alt="Kontaktieren Sie uns">
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>&copy; 2024 PlantBuddy. Alle Rechte vorbehalten.</p>
+    </footer>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\footer.html
+
+<footer>
+    <p>&copy; 2024 PlantBuddy. Alle Rechte vorbehalten.</p>
+</footer>
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\forgot_password.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='authStyles.css') }}">
+    <title>Forgot Password</title>
+    <style>
+        body {
+            background: url("{{ url_for('static', filename='images/Hexagon_Wall Shelves_Plant.jpg') }}") no-repeat center center/cover;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: 'Roboto', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div class="forgot-password-container">
+        <div class="forgot-password-form">
+            <h2>Forgot Password</h2>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="flash-messages">
+                        {% for message in messages %}
+                            <div class="flash">{{ message }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            {% endwith %}
+            <form action="{{ url_for('auth.forgot_password') }}" method="POST">
+                <div class="input-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" required>
+                </div>
+                <button type="submit" class="btn">Send Reset Link</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\header.html
+
+<header>
+    <nav>
+        <div class="logo">PlantBuddy</div>
+        <ul>
+            <li><a href="{{ url_for('main.home') }}">Home</a></li>
+            <li><a href="#">Blog</a></li>
+            {% if current_user.is_authenticated %}
+                <li><a href="{{ url_for('plants.plants') }}">Plants</a></li>
+                {% if current_user.is_admin %}
+                    <li><a href="{{ url_for('admin') }}">Admin</a></li>
+                {% endif %}
+                <li><a href="{{ url_for('auth.logout') }}">Logout</a></li>
+            {% else %}
+                <li><a href="{{ url_for('main.contact_us') }}">Contact Us</a></li>
+                <li><a href="{{ url_for('auth.login') }}">Login</a></li>
+            {% endif %}
+        </ul>
+    </nav>
+</header>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\home.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <title>Plantbuddy</title>
+</head>
+<body>
+    {% include 'header.html' %}
+    <main>
+        <section class="hero">
+            <div class="content">
+                <h1>Sorge für deine Pflanzen wie ein Profi!</h1>
+                <p>Professionelle Pflanzenpflege direkt zur Hand: Gieß-Erinnerungen, Pflanzenidentifikation und eine weltweite Gemeinschaft von Pflanzenliebhabern.</p>
+                {% if not current_user.is_authenticated %}
+                    <a href="{{ url_for('auth.register') }}" class="btn">Register now</a>
+                {% endif %}
+            </div>
+            <div class="image">
+                <img src="{{ url_for('static', filename='images/Panel_Indoor_Plants.jpg') }}" alt="Plant with Sensor">
+            </div>
+        </section>
+        <section class="features">
+            <h2>Take the guesswork out of plant care for students!</h2>
+            <div class="features-container">
+                <div class="feature">
+                    <img src="{{ url_for('static', filename='images/icons8-search-96.png') }}" alt="Identify">
+                    <h3>Identify, care, and grow</h3>
+                    <p>PlantBuddy kann über 50 Pflanzenarten identifizieren und dir Pflegehinweise sowie typische Krankheiten aufzeigen.</p>
+                </div>
+                <div class="feature">
+                    <img src="{{ url_for('static', filename='images/icons8-add-reminder-96.png') }}" alt="E-Mail reminders">
+                    <h3>E-Mail reminders</h3>
+                    <p>Erhalte E-Mail-Erinnerungen zum Gießen und Düngen deiner Pflanzen.</p>
+                </div>
+                <div class="feature">
+                    <img src="{{ url_for('static', filename='images/icons8-contact-us-96.png') }}" alt="Contact us">
+                    <h3>A blooming community</h3>
+                    <p>Bei Problemen hilft dir unsere Kontaktseite weiter.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+    {% include 'footer.html' %}
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\login.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='authStyles.css') }}">
+    <title>Login</title>
+    <style>
+        body {
+            background: url("{{ url_for('static', filename='images/Hexagon_Wall Shelves_Plant.jpg') }}") no-repeat center center/cover;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: 'Roboto', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-form">
+            <h2>Sign In</h2>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="flash-messages">
+                        {% for message in messages %}
+                            <div class="flash">{{ message }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            {% endwith %}
+            <form action="{{ url_for('auth.login') }}" method="POST">
+                <div class="input-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" required>
+                </div>
+                <div class="input-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit" class="btn">Login</button>
+                <div class="links">
+                    <a href="{{ url_for('auth.forgot_password') }}">Forgot your password? Reset now</a>
+                </div>
+                <div class="links">
+                    <a href="{{ url_for('auth.register') }}">Create a new Account</a>
+                </div>
+                <div class="register-social-login">
+                    <a href="{{ url_for('auth.google_login') }}" class="register-social-btn">
+                        <img src="{{ url_for('static', filename='images/icons8-google-128.png') }}" alt="Google Icon"> Login with Google
+                    </a>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\my_plants.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>My Plants</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    {% include 'header.html' %}
+    <h1>My Plants</h1>
+    <div class="plants-container">
+        {% for user_plant in user_plants %}
+        <div class="plant-card">
+            <img src="{{ user_plant.plant.photo }}" alt="{{ user_plant.plant.name }}">
+            <h2>{{ user_plant.plant.name }}</h2>
+            <p>Last Watered: {{ user_plant.last_watered_date.strftime('%Y-%m-%d') if user_plant.last_watered_date else 'Never' }}</p>
+            <a href="{{ url_for('plants.plant_detail', plant_id=user_plant.plant.id) }}" class="button">Details</a>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\plants.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Plants</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='plants.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    {% include 'header.html' %}
+    <div class="plants-container">
+        {% for plant in plants %}
+        <div class="plant-card">
+            <img src="{{ plant.photo }}" alt="{{ plant.name }}">
+            <h2>{{ plant.name }}</h2>
+            <div class="hover-buttons">
+                <a href="{{ url_for('plants.plant_detail', plant_id=plant.id) }}" class="button">Details</a>
+                <a href="{{ url_for('plants.add_plant', plant_id=plant.id) }}" class="button">Add to My Plants</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\plant_detail.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ plant.name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='plants.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    {% include 'header.html' %}
+    <div class="plant-detail-container">
+        <div class="plant-detail-image">
+            <img src="{{ url_for('static', filename=plant.photo[7:]) }}" alt="{{ plant.name }}">
+        </div>
+        <div class="plant-detail-info">
+            <h1>{{ plant.name }}</h1>
+            <p>{{ plant.description }}</p>
+            <p><strong>Placement:</strong> {{ plant.placement }}</p>
+            <p><strong>Water Demand:</strong> {{ plant.water_demand }}</p>
+            <p><strong>Fertilizing:</strong> {{ plant.fertilizing }}</p>
+            <a href="{{ url_for('plants.plants') }}" class="button">Back to All Plants</a>
+        </div>
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\register.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='authStyles.css') }}">
+    <title>Register</title>
+    <style>
+        body {
+            background: url("{{ url_for('static', filename='images/Hexagon_Wall Shelves_Plant.jpg') }}") no-repeat center center/cover;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: 'Roboto', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                <div class="flash-messages">
+                    {% for message in messages %}
+                        <div class="flash">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+        <div class="register-form">
+            <h2>Sign Up</h2>
+            <form action="{{ url_for('auth.register') }}" method="POST">
+                <div class="register-input-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="register-input-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" required>
+                </div>
+                <div class="register-input-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="register-input-group">
+                    <label for="confirm_password">Confirm Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required>
+                </div>
+                <button type="submit" class="register-btn">Sign Up</button>
+                <div class="register-links">
+                    <a href="{{ url_for('auth.login') }}">Already have an account? Login</a>
+                </div>
+            </form>
+            <div class="register-social-login">
+                <a href="{{ url_for('auth.google_login') }}" class="register-social-btn">
+                    <img src="{{ url_for('static', filename='images/icons8-google-128.png') }}" alt="Google Icon"> Login with Google
+                </a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\reset_password.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="{{ url_for('static', filename='authStyles.css') }}">
+    <title>Reset Password</title>
+    <style>
+        body {
+            background: url("{{ url_for('static', filename='images/Hexagon_Wall Shelves_Plant.jpg') }}") no-repeat center center/cover;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: 'Roboto', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div class="reset-password-container">
+        <div class="reset-password-form">
+            <h2>Reset Password</h2>
+            <form action="{{ url_for('auth.reset_password', token=token) }}" method="POST">
+                <div class="input-group">
+                    <label for="password">New Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="input-group">
+                    <label for="confirm_password">Confirm Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required>
+                </div>
+                <button type="submit" class="btn">Reset Password</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+
+
+--------------------------------------------------------------------------------
+
+File: plantbuddy\templates\email\reminder.html
+
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Plant Care Reminder</title>
+</head>
+<body>
+    <p>Dear {{ user.username }},</p>
+    <p>This is a friendly reminder to water your plant(s):</p>
+    <ul>
+        {% for plant in plants %}
+        <li>{{ plant.name }} - Water Demand: {{ plant.water_demand }}</li>
+        {% endfor %}
+    </ul>
+    <p>Happy gardening!</p>
+</body>
+</html>
+
+--------------------------------------------------------------------------------
+
